@@ -290,7 +290,7 @@ turboquant-thor/
 │   ├── rotation.py          # Structured WHT + random signs
 │   ├── quantizer.py         # TurboQuant_mse (no _prod)
 │   └── sparse_v.py          # Adaptive sparse V dequant
-├── mlx/
+├── mlx_integration/
 │   ├── cache.py             # MLX KV cache with ring buffer
 │   ├── attention.py         # Fused attention with centroid table lookup
 │   ├── kernels/             # Custom Metal shaders
