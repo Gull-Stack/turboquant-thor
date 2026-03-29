@@ -14,13 +14,15 @@ import mlx.core as mx
 
 def _vals_per_word(bits: int) -> int:
     """Number of values packed per uint32 word."""
+    if bits == 1:
+        return 32
     if bits == 2:
         return 16
     if bits == 3:
         return 10
     if bits == 4:
         return 8
-    raise ValueError(f"Unsupported bits: {bits}. Use 2, 3, or 4.")
+    raise ValueError(f"Unsupported bits: {bits}. Use 1, 2, 3, or 4.")
 
 
 def pack_indices(indices: mx.array, bits: int) -> mx.array:

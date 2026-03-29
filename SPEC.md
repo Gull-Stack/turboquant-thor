@@ -80,7 +80,7 @@ Function `apply_sparse_v(weights, v_dequant_fn, config)`:
 
 Expected: +15-25% decode speed at 16K+ context, 0 quality loss.
 
-### 5. mlx/cache.py — MLX KV Cache with Compression
+### 5. mlx_integration/cache.py — MLX KV Cache with Compression
 Drop-in replacement for mlx-lm's KVCache.
 
 Class `TurboQuantKVCache`:
@@ -100,7 +100,7 @@ Config defaults for M4 Pro:
 - layer_adaptive=True (last 20% at +1 bit)
 - sparse_v=True (adaptive percentile)
 
-### 6. mlx/attention.py — TurboQuant SDPA
+### 6. mlx_integration/attention.py — TurboQuant SDPA
 Modified scaled dot-product attention that works with compressed cache.
 
 Function `turboquant_sdpa(queries, cache, scale, mask)`:
@@ -115,7 +115,7 @@ Matrix associativity optimization (from sharpner):
 output = (weights @ v_centroids) @ Π  instead of  weights @ (v_centroids @ Π)
 Saves O(T_kv × D²) → O(T_q × D²) for inverse rotation.
 
-### 7. mlx/patch.py — mlx-lm Integration
+### 7. mlx_integration/patch.py — mlx-lm Integration
 Monkey-patch mlx-lm's SDPA dispatch to use TurboQuant cache.
 
 Function `apply(model, config)`:
@@ -158,7 +158,7 @@ turboquant-thor/
 │   ├── quantizer.py          # TurboQuantMSE
 │   ├── packing.py            # Bit packing (2/3/4-bit into uint32)
 │   └── sparse_v.py           # Adaptive sparse V
-├── mlx/
+├── mlx_integration/
 │   ├── __init__.py
 │   ├── cache.py              # TurboQuantKVCache
 │   ├── attention.py          # Modified SDPA
@@ -212,11 +212,11 @@ pytest >= 7.0
 3. core/packing.py + tests (bit packing)
 4. core/quantizer.py + tests
 5. core/sparse_v.py + tests
-6. mlx/cache.py
-7. mlx/attention.py
-8. mlx/patch.py
+6. mlx_integration/cache.py
+7. mlx_integration/attention.py
+8. mlx_integration/patch.py
 9. validation/ scripts
 10. run_demo.py
 11. benchmarks/
 
-Build ALL core/ and tests/ first, verify math is correct, then build mlx/ integration.
+Build ALL core/ and tests/ first, verify math is correct, then build mlx_integration/ integration.

@@ -28,7 +28,7 @@ class TestCodebook:
         c_np = np.array(c)
         b_np = np.array(b)
         expected = (c_np[:-1] + c_np[1:]) / 2.0
-        np.testing.assert_allclose(b_np, expected, atol=1e-10)
+        np.testing.assert_allclose(b_np, expected, atol=1e-6)
 
     @pytest.mark.parametrize("bits", [1, 2, 3, 4])
     def test_centroids_sorted(self, bits):

@@ -1,6 +1,6 @@
 [build-system]
 requires = ["setuptools>=68.0", "wheel"]
-build-backend = "setuptools.backends._legacy:_Backend"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "turboquant-thor"
@@ -22,7 +22,7 @@ dev = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["core*", "mlx*", "validation*", "benchmarks*"]
+include = ["core*", "mlx_integration*", "validation*", "benchmarks*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
