@@ -20,9 +20,8 @@ import mlx.core as mx
 from core.codebook import get_codebook, quantize_to_indices
 from core.packing import pack_indices, unpack_indices, packed_size
 from core.rotation import Rotation, generate_rotation, rotate_forward, rotate_inverse, safe_normalize
-from core.metal_kernels import (
-    fused_quantize_pack, fused_dequant_unpack,
-    fused_normalize_signflip, fused_signflip_scale,
+from core.metal_kernels_v2 import (
+    fused_full_quantize, fused_full_dequantize,
 )
 
 
@@ -136,7 +135,7 @@ class TurboQuantKVCache:
     ):
         """Quantize (B, H, L, D) tensor → packed indices + norms.
 
-        Uses fused Metal kernels for normalize+signflip and quantize+pack.
+        Single fused Metal kernel: normalize → sign-flip → WHT butterfly → quantize → pack
 
         Returns:
             packed: (B, H, L, n_words) uint32
@@ -145,23 +144,13 @@ class TurboQuantKVCache:
         B, H, L, D = x.shape
         flat = x.reshape(-1, D)  # (B*H*L, D)
 
-        # Compute norms
-        norms = mx.linalg.norm(flat, axis=-1, keepdims=True)
-
-        # Fused normalize + sign-flip (Metal kernel)
-        norms_flat = norms.reshape(-1)
-        flipped = fused_normalize_signflip(flat, norms_flat, self.rotation.signs, D)
-
-        # WHT rotation (optimized matmul — keep on GPU)
-        y = flipped @ self.rotation.hadamard.T
-
-        # Fused quantize + pack (Metal kernel)
-        packed = fused_quantize_pack(y, boundaries, bits)
+        # Fully fused quantize (one GPU dispatch)
+        packed, norms_flat = fused_full_quantize(flat, self.rotation.signs, boundaries, bits)
 
         # Reshape back
         n_words = packed.shape[-1]
         packed = packed.reshape(B, H, L, n_words)
-        norms = norms.reshape(B, H, L, 1)
+        norms = norms_flat.reshape(B, H, L, 1)
 
         return packed, norms
 
@@ -170,27 +159,17 @@ class TurboQuantKVCache:
     ):
         """Dequantize packed indices + norms → (B, H, T, D) tensor.
 
-        Uses fused Metal kernels for unpack+lookup and signflip+scale.
-        Per-row unpacking to handle padding correctly.
+        Single fused Metal kernel: unpack → centroid lookup → inverse WHT butterfly → sign-flip → scale
         """
         B, H, T, n_words = packed.shape
         N = B * H * T
         D = self.head_dim
 
-        # Unpack per-row to handle padding correctly
-        # Each row of n_words unpacks to vpw*n_words values, then trim to D
         flat_packed = packed.reshape(N, n_words)
+        flat_norms = norms.reshape(N)
 
-        # Use Python path for unpack+lookup (row-aware)
-        indices = unpack_indices(flat_packed, bits, D)
-        y_hat = centroids[indices]  # (N, D)
-
-        # Inverse WHT rotation (optimized matmul)
-        unrotated = y_hat @ self.rotation.hadamard
-
-        # Fused sign-flip + norm scaling (Metal kernel)
-        flat_norms = norms.reshape(-1)
-        x_hat = fused_signflip_scale(unrotated, self.rotation.signs, flat_norms, D)
+        # Fully fused dequantize (one GPU dispatch)
+        x_hat = fused_full_dequantize(flat_packed, centroids, self.rotation.signs, flat_norms, bits, D)
 
         return x_hat.reshape(B, H, T, self.head_dim)
 
