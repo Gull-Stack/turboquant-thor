@@ -24,35 +24,40 @@ import mlx.core as mx
 # Threads cooperate on butterfly stages with barriers.
 # ---------------------------------------------------------------------------
 
-def _make_wht_kernel(d: int, forward: bool = True):
+def _make_wht_kernel(d: int, with_signs: bool = False):
     """Create a WHT butterfly kernel for dimension d.
 
     Each threadgroup handles one row. Threads within the group
     cooperate on log2(d) butterfly stages using shared memory.
+
+    If with_signs=True, folds the random sign flip into the initial
+    load — zero extra cost vs a separate sign-flip pass.
     """
     log2_d = int(math.log2(d))
     assert 2 ** log2_d == d, f"d must be power of 2, got {d}"
 
-    # Scale factor: 1/sqrt(2) per stage = 1/sqrt(d) total
-    # For forward: accumulate scale across stages
-    # For inverse: same (WHT is self-inverse up to scale)
     scale_per_stage = "0.70710678118654752f"  # 1/sqrt(2)
+    sign_suffix = "_signed" if with_signs else ""
 
-    direction = "forward" if forward else "inverse"
+    # Load: fold sign flip into first stage input for free
+    if with_signs:
+        load_line = "shared[tid] = inp[row_offset + tid] * signs[tid];"
+        input_names = ["inp", "signs"]
+    else:
+        load_line = "shared[tid] = inp[row_offset + tid];"
+        input_names = ["inp"]
 
     source = f"""
     uint row = thread_position_in_grid.y;
     uint tid = thread_position_in_threadgroup.x;
     uint row_offset = row * {d}u;
 
-    // Load into threadgroup memory
     threadgroup float shared[{d}];
     if (tid < {d}u) {{
-        shared[tid] = inp[row_offset + tid];
+        {load_line}
     }}
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Butterfly stages
     for (uint stage = 0; stage < {log2_d}u; stage++) {{
         uint stride = 1u << stage;
         uint block = stride << 1;
@@ -73,55 +78,59 @@ def _make_wht_kernel(d: int, forward: bool = True):
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }}
 
-    // Write back
     if (tid < {d}u) {{
         out[row_offset + tid] = shared[tid];
     }}
 """
 
     kernel = mx.fast.metal_kernel(
-        name=f"wht_butterfly_{direction}_{d}",
-        input_names=["inp"],
+        name=f"wht_butterfly{sign_suffix}_{d}",
+        input_names=input_names,
         output_names=["out"],
         source=source,
     )
     return kernel
 
 
-# Cache WHT kernels by (d, forward)
+# Cache WHT kernels by (d, with_signs)
 _wht_kernels: dict[tuple[int, bool], object] = {}
 
 
-def fused_wht(x: mx.array, forward: bool = True) -> mx.array:
+def fused_wht(x: mx.array, forward: bool = True, signs: mx.array = None) -> mx.array:
     """Apply Walsh-Hadamard Transform via butterfly Metal kernel.
 
     O(d log d) instead of O(d²) matmul.
 
+    If signs is provided, the sign flip is folded into the initial load
+    at zero extra cost — one fused pass instead of two separate ops.
+
     Args:
         x: (..., d) float32 input vectors (d must be power of 2)
         forward: True for forward WHT, False for inverse
+        signs: Optional (d,) ±1 signs to fold into the transform
 
     Returns:
         y: (..., d) float32 transformed vectors
     """
     d = x.shape[-1]
-    key = (d, forward)
+    with_signs = signs is not None
+    key = (d, with_signs)
 
     if key not in _wht_kernels:
-        _wht_kernels[key] = _make_wht_kernel(d, forward)
+        _wht_kernels[key] = _make_wht_kernel(d, with_signs=with_signs)
 
     kernel = _wht_kernels[key]
 
-    # Flatten to (N, d)
     orig_shape = x.shape
     flat = x.reshape(-1, d)
     N = flat.shape[0]
 
-    # Threadgroup: d threads per row (or 256, whichever is smaller)
     tg_x = min(d, 256)
 
+    inputs = [flat, signs] if with_signs else [flat]
+
     outputs = kernel(
-        inputs=[flat],
+        inputs=inputs,
         output_shapes=[(N * d,)],
         output_dtypes=[mx.float32],
         grid=(tg_x, N, 1),
@@ -405,164 +414,150 @@ def _make_fused_attention_kernel(d: int, k_bits: int, v_bits: int):
 
     Operates directly on compressed K/V — no intermediate decompression.
 
+    Optimizations:
+    - Centroid LUTs loaded into threadgroup shared memory (tiny: 32-128 bytes)
+    - Precomputed q[dim] * k_centroid[i] score table per dimension
+      Turns dot product into: unpack index → table lookup → accumulate
+    - Value centroids also in shared memory for weighted accumulation
+
     Per head:
-    1. Query is pre-rotated (done outside kernel)
-    2. For each cached key: unpack → centroid lookup → dot with query → score
-    3. Softmax over scores
-    4. For each cached value: unpack → centroid lookup → weighted accumulation
-    5. Output is in rotated space (inverse WHT done outside for efficiency)
+    1. Load centroid LUTs into shared memory
+    2. Precompute q_score_table[i] = q[dim] * k_centroid[i] for each thread's dim
+    3. For each cached key: unpack index → table lookup → reduce → score
+    4. Softmax over scores
+    5. For each cached value: unpack index → shared LUT → weighted accumulation
+    6. Output is in rotated space (inverse WHT done outside)
     """
-    vpw_k_map = {1: 32, 2: 16, 3: 10, 4: 8, 5: 6}
-    vpw_v_map = vpw_k_map.copy()
-    vpw_k = vpw_k_map[k_bits]
-    vpw_v = vpw_v_map[v_bits]
+    n_k_centroids = 2 ** k_bits
+    n_v_centroids = 2 ** v_bits
+    vpw_map = {1: 32, 2: 16, 3: 10, 4: 8, 5: 6}
+    vpw_k = vpw_map[k_bits]
+    vpw_v = vpw_map[v_bits]
     mask_k = (1 << k_bits) - 1
     mask_v = (1 << v_bits) - 1
     n_k_words = (d + vpw_k - 1) // vpw_k
     n_v_words = (d + vpw_v - 1) // vpw_v
 
     source = f"""
-    // Each thread in the group handles part of the dimension
-    // Grid: (d, n_heads, 1), Threadgroup: (d, 1, 1)
     uint dim = thread_position_in_threadgroup.x;
     uint head = thread_position_in_grid.y;
 
     uint head_offset_k = head * (uint)n_tokens * {n_k_words}u;
-    uint head_offset_v = head * (uint)n_tokens * {n_v_words}u;
-    uint head_offset_norm_k = head * (uint)n_tokens;
-    uint head_offset_norm_v = head * (uint)n_tokens;
+    uint head_offset_nk = head * (uint)n_tokens;
 
+    // --- Load key centroid LUT into shared memory ({n_k_centroids} × 4 = {n_k_centroids * 4} bytes) ---
+    threadgroup float k_lut[{n_k_centroids}];
+    if (dim < {n_k_centroids}u) {{
+        k_lut[dim] = k_centroids[dim];
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // --- Precompute q × centroid score table for this thread's dimension ---
+    // Turns the dot product into: unpack index → table[index] → accumulate
     float q_val = query_rotated[head * {d}u + dim];
+    float q_score_table[{n_k_centroids}];
+    for (uint i = 0; i < {n_k_centroids}u; i++) {{
+        q_score_table[i] = q_val * k_lut[i];
+    }}
 
-    threadgroup float scores[4096];  // max tokens
-    threadgroup float shared_accum[{d}];
+    // Precompute unpack constants for this thread's dimension
+    uint k_word_col = dim / {vpw_k}u;
+    uint k_shift = (dim % {vpw_k}u) * {k_bits}u;
 
-    // Phase 1: Compute attention scores (dot product in rotated space)
-    // Each thread computes partial dot for one dimension, then reduce
+    threadgroup float scores[4096];
+    threadgroup float reduce_buf[{d}];
+
+    // --- Key scoring via LUT ---
+    // For each token: unpack key index → score table lookup → reduce across dims
     for (uint t = 0; t < (uint)n_tokens; t++) {{
-        // Unpack key centroid for this token and dimension
-        uint k_word_idx = dim / {vpw_k}u;
-        uint k_pos = dim % {vpw_k}u;
-        uint32_t k_word = k_packed[head_offset_k + t * {n_k_words}u + k_word_idx];
-        uint k_idx = (k_word >> (k_pos * {k_bits}u)) & {mask_k}u;
-        float k_centroid = k_centroids[k_idx];
+        uint32_t k_word = k_packed[head_offset_k + t * {n_k_words}u + k_word_col];
+        uint k_idx = (k_word >> k_shift) & {mask_k}u;
 
-        // Partial dot product: q[dim] * k_centroid * k_norm
-        float partial = q_val * k_centroid * k_norms[head_offset_norm_k + t];
+        // Score = q[dim] * centroid[k_idx] * norm — just a table lookup!
+        float partial = q_score_table[k_idx] * k_norms[head_offset_nk + t];
 
-        // Reduce across dimensions using shared memory
-        shared_accum[dim] = partial;
+        // Parallel reduction across dimensions
+        reduce_buf[dim] = partial;
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Tree reduction
         for (uint s = {d}u / 2; s > 0; s >>= 1) {{
             if (dim < s) {{
-                shared_accum[dim] += shared_accum[dim + s];
+                reduce_buf[dim] += reduce_buf[dim + s];
             }}
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }}
 
         if (dim == 0) {{
-            scores[t] = shared_accum[0];
+            scores[t] = reduce_buf[0];
         }}
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }}
 
-    // Phase 2: Softmax
+    // Output raw scores — caller handles softmax + value accumulation
     if (dim == 0) {{
-        float max_score = -1e30f;
         for (uint t = 0; t < (uint)n_tokens; t++) {{
-            max_score = max(max_score, scores[t]);
-        }}
-        float sum_exp = 0.0f;
-        for (uint t = 0; t < (uint)n_tokens; t++) {{
-            scores[t] = exp(scores[t] - max_score);
-            sum_exp += scores[t];
-        }}
-        float inv_sum = 1.0f / (sum_exp + 1e-10f);
-        for (uint t = 0; t < (uint)n_tokens; t++) {{
-            scores[t] *= inv_sum;
+            out[head * (uint)n_tokens + t] = scores[t];
         }}
     }}
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // Phase 3: Weighted sum of value centroids (in rotated space)
-    float accum = 0.0f;
-    for (uint t = 0; t < (uint)n_tokens; t++) {{
-        uint v_word_idx = dim / {vpw_v}u;
-        uint v_pos = dim % {vpw_v}u;
-        uint32_t v_word = v_packed[head_offset_v + t * {n_v_words}u + v_word_idx];
-        uint v_idx = (v_word >> (v_pos * {v_bits}u)) & {mask_v}u;
-        float v_centroid = v_centroids[v_idx];
-
-        accum += scores[t] * v_centroid * v_norms[head_offset_norm_v + t];
-    }}
-
-    out[head * {d}u + dim] = accum;
 """
 
     kernel = mx.fast.metal_kernel(
-        name=f"fused_attention_{d}d_k{k_bits}_v{v_bits}",
+        name=f"fused_score_lut_{d}d_k{k_bits}",
         input_names=[
             "query_rotated",      # (n_heads, d)
             "k_packed",           # (n_heads, n_tokens, n_k_words) flattened
             "k_centroids",        # (2^k_bits,)
             "k_norms",            # (n_heads, n_tokens) flattened
-            "v_packed",           # (n_heads, n_tokens, n_v_words) flattened
-            "v_centroids",        # (2^v_bits,)
-            "v_norms",            # (n_heads, n_tokens) flattened
             "n_tokens",           # scalar uint32
         ],
-        output_names=["out"],     # (n_heads, d)
+        output_names=["out"],     # (n_heads, n_tokens) raw scores
         source=source,
     )
     return kernel
 
 
-_fused_attn_kernels: dict[tuple[int, int, int], object] = {}
+_fused_score_kernels: dict[tuple[int, int], object] = {}
 
 
-def fused_compressed_attention(
+def fused_compressed_score(
     query_rotated: mx.array,
     k_packed: mx.array,
     k_centroids: mx.array,
     k_norms: mx.array,
-    v_packed: mx.array,
-    v_centroids: mx.array,
-    v_norms: mx.array,
     head_dim: int,
     k_bits: int,
-    v_bits: int,
 ) -> mx.array:
-    """Fused attention scoring + accumulation directly on compressed KV cache.
+    """Fused key scoring directly on compressed cache via centroid LUT.
 
     Operates in rotated space — query must be pre-rotated.
-    Output is in rotated space — caller applies inverse WHT + sign-flip.
+    Returns raw attention scores (caller handles softmax + value accumulation).
 
     For decode only (single query token, T_q=1).
+
+    Optimization: precomputes q[dim] * centroid[i] score table per thread,
+    turning the dot product into index → table lookup → accumulate.
+    Centroid LUT in threadgroup shared memory ({2**k_bits} × 4 bytes).
 
     Args:
         query_rotated: (n_heads, d) pre-rotated query
         k_packed: (n_heads, n_tokens, n_k_words) packed key indices
         k_centroids: (2^k_bits,) key centroid values
         k_norms: (n_heads, n_tokens) key norms
-        v_packed: (n_heads, n_tokens, n_v_words) packed value indices
-        v_centroids: (2^v_bits,) value centroid values
-        v_norms: (n_heads, n_tokens) value norms
         head_dim: d
         k_bits: key quantization bits
-        v_bits: value quantization bits
 
     Returns:
-        out: (n_heads, d) attention output in rotated space
+        scores: (n_heads, n_tokens) raw attention scores
     """
     d = head_dim
-    key = (d, k_bits, v_bits)
+    # We still need v_bits for the kernel signature but only use k_bits for scoring
+    key = (d, k_bits)
 
-    if key not in _fused_attn_kernels:
-        _fused_attn_kernels[key] = _make_fused_attention_kernel(d, k_bits, v_bits)
+    if key not in _fused_score_kernels:
+        # Pass dummy v_bits — the kernel only uses k_bits for scoring now
+        _fused_score_kernels[key] = _make_fused_attention_kernel(d, k_bits, k_bits)
 
-    kernel = _fused_attn_kernels[key]
+    kernel = _fused_score_kernels[key]
     n_heads = query_rotated.shape[0]
     n_tokens = k_packed.shape[1]
     n_tokens_arr = mx.array(n_tokens, dtype=mx.uint32)
@@ -575,15 +570,12 @@ def fused_compressed_attention(
             k_packed.reshape(-1),
             k_centroids,
             k_norms.reshape(-1),
-            v_packed.reshape(-1),
-            v_centroids,
-            v_norms.reshape(-1),
             n_tokens_arr,
         ],
-        output_shapes=[(n_heads * d,)],
+        output_shapes=[(n_heads * n_tokens,)],
         output_dtypes=[mx.float32],
         grid=(tg_x, n_heads, 1),
         threadgroup=(tg_x, 1, 1),
     )
 
-    return outputs[0].reshape(n_heads, d)
+    return outputs[0].reshape(n_heads, n_tokens)

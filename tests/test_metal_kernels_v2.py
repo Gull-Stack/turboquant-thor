@@ -8,7 +8,7 @@ from core.metal_kernels_v2 import (
     fused_wht,
     fused_full_quantize,
     fused_full_dequantize,
-    fused_compressed_attention,
+    fused_compressed_score,
 )
 from core.rotation import generate_rotation, rotate_forward, rotate_inverse, safe_normalize
 from core.codebook import get_codebook
@@ -66,6 +66,26 @@ class TestFusedWHT:
         x_norms = np.linalg.norm(np.array(x), axis=-1)
         y_norms = np.linalg.norm(np.array(y), axis=-1)
         np.testing.assert_allclose(x_norms, y_norms, rtol=1e-3)
+
+    def test_with_signs_folded(self):
+        """WHT with signs folded in should match separate sign-flip + WHT."""
+        d = 128
+        rotation = generate_rotation(d, seed=42)
+        x = mx.random.normal(shape=(10, d))
+        mx.eval(x)
+
+        # Separate: sign-flip then WHT
+        flipped = x * rotation.signs
+        y_separate = fused_wht(flipped)
+        mx.eval(y_separate)
+
+        # Fused: signs folded into first-stage load
+        y_fused = fused_wht(x, signs=rotation.signs)
+        mx.eval(y_fused)
+
+        np.testing.assert_allclose(
+            np.array(y_separate), np.array(y_fused), atol=1e-5,
+        )
 
 
 class TestFusedFullQuantize:
@@ -163,88 +183,112 @@ class TestFusedFullDequantize:
         )
 
 
-class TestFusedCompressedAttention:
+class TestFusedCompressedScore:
     def test_output_shape(self):
-        """Fused attention output shape must be (n_heads, d)."""
+        """Fused scores must be (n_heads, n_tokens)."""
         d = 128
         n_heads = 4
         n_tokens = 20
-        k_bits, v_bits = 4, 4
+        k_bits = 4
 
         rotation = generate_rotation(d, seed=42)
         k_centroids, k_boundaries = get_codebook(k_bits, d)
-        v_centroids, v_boundaries = get_codebook(v_bits, d)
 
-        # Create compressed cache
-        keys = mx.random.normal(shape=(n_heads, n_tokens, d))
-        values = mx.random.normal(shape=(n_heads, n_tokens, d))
+        keys = mx.random.normal(shape=(n_heads * n_tokens, d))
         query = mx.random.normal(shape=(n_heads, d))
-        mx.eval(keys, values, query)
+        mx.eval(keys, query)
 
-        # Quantize keys and values
-        k_flat = keys.reshape(-1, d)
-        v_flat = values.reshape(-1, d)
-        k_packed, k_norms = fused_full_quantize(k_flat, rotation.signs, k_boundaries, k_bits)
-        v_packed, v_norms = fused_full_quantize(v_flat, rotation.signs, v_boundaries, v_bits)
-        mx.eval(k_packed, k_norms, v_packed, v_norms)
+        k_packed, k_norms = fused_full_quantize(keys, rotation.signs, k_boundaries, k_bits)
+        mx.eval(k_packed, k_norms)
 
         n_k_words = k_packed.shape[-1]
-        n_v_words = v_packed.shape[-1]
         k_packed = k_packed.reshape(n_heads, n_tokens, n_k_words)
-        v_packed = v_packed.reshape(n_heads, n_tokens, n_v_words)
         k_norms = k_norms.reshape(n_heads, n_tokens)
-        v_norms = v_norms.reshape(n_heads, n_tokens)
 
-        # Pre-rotate query
-        q_rotated = (query * rotation.signs) @ rotation.hadamard.T
+        # Pre-rotate query (sign flip folded into butterfly)
+        q_rotated = fused_wht(query, signs=rotation.signs)
         mx.eval(q_rotated)
 
-        # Run fused attention
-        out = fused_compressed_attention(
-            q_rotated, k_packed, k_centroids, k_norms,
-            v_packed, v_centroids, v_norms, d, k_bits, v_bits,
+        scores = fused_compressed_score(
+            q_rotated, k_packed, k_centroids, k_norms, d, k_bits,
         )
-        mx.eval(out)
+        mx.eval(scores)
 
-        assert out.shape == (n_heads, d)
+        assert scores.shape == (n_heads, n_tokens)
 
-    def test_attention_reasonable(self):
-        """Output should be bounded and not NaN/Inf."""
+    def test_scores_match_reference(self):
+        """Fused scores must match explicit decompress-then-dot."""
         d = 128
         n_heads = 2
         n_tokens = 10
-        k_bits, v_bits = 4, 4
+        k_bits = 4
 
         rotation = generate_rotation(d, seed=42)
         k_centroids, k_boundaries = get_codebook(k_bits, d)
-        v_centroids, v_boundaries = get_codebook(v_bits, d)
 
         keys = mx.random.normal(shape=(n_heads * n_tokens, d))
-        values = mx.random.normal(shape=(n_heads * n_tokens, d))
         query = mx.random.normal(shape=(n_heads, d))
-        mx.eval(keys, values, query)
+        mx.eval(keys, query)
 
+        # Quantize keys
         k_packed, k_norms = fused_full_quantize(keys, rotation.signs, k_boundaries, k_bits)
-        v_packed, v_norms = fused_full_quantize(values, rotation.signs, v_boundaries, v_bits)
-        mx.eval(k_packed, k_norms, v_packed, v_norms)
+        mx.eval(k_packed, k_norms)
 
+        # Reference: decompress keys, then dot with query in rotated space
+        k_decompressed = fused_full_dequantize(
+            k_packed, k_centroids, rotation.signs, k_norms, k_bits, d
+        )
+        mx.eval(k_decompressed)
+        k_dec = k_decompressed.reshape(n_heads, n_tokens, d)
+        # scores_ref[h, t] = query[h] . k_dec[h, t]
+        scores_ref = mx.sum(query[:, None, :] * k_dec, axis=-1)
+        mx.eval(scores_ref)
+
+        # Fused path: pre-rotate query, score in rotated space
         n_k_words = k_packed.shape[-1]
-        n_v_words = v_packed.shape[-1]
-        k_packed = k_packed.reshape(n_heads, n_tokens, n_k_words)
-        v_packed = v_packed.reshape(n_heads, n_tokens, n_v_words)
-        k_norms = k_norms.reshape(n_heads, n_tokens)
-        v_norms = v_norms.reshape(n_heads, n_tokens)
+        k_packed_3d = k_packed.reshape(n_heads, n_tokens, n_k_words)
+        k_norms_2d = k_norms.reshape(n_heads, n_tokens)
 
-        q_rotated = (query * rotation.signs) @ rotation.hadamard.T
+        q_rotated = fused_wht(query, signs=rotation.signs)
         mx.eval(q_rotated)
 
-        out = fused_compressed_attention(
-            q_rotated, k_packed, k_centroids, k_norms,
-            v_packed, v_centroids, v_norms, d, k_bits, v_bits,
+        scores_fused = fused_compressed_score(
+            q_rotated, k_packed_3d, k_centroids, k_norms_2d, d, k_bits,
         )
-        mx.eval(out)
+        mx.eval(scores_fused)
 
-        out_np = np.array(out)
-        assert not np.any(np.isnan(out_np)), "Output contains NaN"
-        assert not np.any(np.isinf(out_np)), "Output contains Inf"
-        assert np.all(np.abs(out_np) < 100), "Output values unreasonably large"
+        np.testing.assert_allclose(
+            np.array(scores_ref), np.array(scores_fused), atol=1e-2, rtol=1e-2,
+        )
+
+    def test_no_nan_inf(self):
+        """Scores should not contain NaN or Inf."""
+        d = 256
+        n_heads = 4
+        n_tokens = 50
+        k_bits = 4
+
+        rotation = generate_rotation(d, seed=42)
+        k_centroids, k_boundaries = get_codebook(k_bits, d)
+
+        keys = mx.random.normal(shape=(n_heads * n_tokens, d))
+        query = mx.random.normal(shape=(n_heads, d))
+        mx.eval(keys, query)
+
+        k_packed, k_norms = fused_full_quantize(keys, rotation.signs, k_boundaries, k_bits)
+        mx.eval(k_packed, k_norms)
+        n_k_words = k_packed.shape[-1]
+        k_packed = k_packed.reshape(n_heads, n_tokens, n_k_words)
+        k_norms = k_norms.reshape(n_heads, n_tokens)
+
+        q_rotated = fused_wht(query, signs=rotation.signs)
+        mx.eval(q_rotated)
+
+        scores = fused_compressed_score(
+            q_rotated, k_packed, k_centroids, k_norms, d, k_bits,
+        )
+        mx.eval(scores)
+
+        scores_np = np.array(scores)
+        assert not np.any(np.isnan(scores_np)), "Scores contain NaN"
+        assert not np.any(np.isinf(scores_np)), "Scores contain Inf"
