@@ -80,9 +80,10 @@ class TurboQuantKVCache:
         self._v_norms = None    # (..., 1) float32
         self.offset = 0
 
-        # Track shapes for unpacking
+        # Track shapes and dtype for unpacking
         self._B = None
         self._n_kv_heads = None
+        self._input_dtype = mx.float32
 
     def update_and_fetch(self, keys: mx.array, values: mx.array):
         """Store new key/value tokens (compressed) and return full cache (decompressed).
@@ -98,10 +99,15 @@ class TurboQuantKVCache:
         B, n_kv_heads, L, D = keys.shape
         self._B = B
         self._n_kv_heads = n_kv_heads
+        self._input_dtype = keys.dtype  # Preserve input dtype for dequantize output
+
+        # Cast to float32 for quantization (Metal kernels operate in float32)
+        keys_f32 = keys.astype(mx.float32) if keys.dtype != mx.float32 else keys
+        values_f32 = values.astype(mx.float32) if values.dtype != mx.float32 else values
 
         # Quantize incoming tokens
-        k_packed, k_norms = self._quantize(keys, self.k_centroids, self.k_boundaries, self.key_bits)
-        v_packed, v_norms = self._quantize(values, self.v_centroids, self.v_boundaries, self.value_bits)
+        k_packed, k_norms = self._quantize(keys_f32, self.k_centroids, self.k_boundaries, self.key_bits)
+        v_packed, v_norms = self._quantize(values_f32, self.v_centroids, self.v_boundaries, self.value_bits)
 
         prev = self.offset
 
@@ -127,6 +133,10 @@ class TurboQuantKVCache:
         cached_values = self._dequantize(
             self._v_packed, self._v_norms, self.v_centroids, self.value_bits
         )
+
+        # Cast back to model dtype (bfloat16) — MLX attention requires matching dtypes
+        cached_keys = cached_keys.astype(self._input_dtype)
+        cached_values = cached_values.astype(self._input_dtype)
 
         return cached_keys, cached_values
 

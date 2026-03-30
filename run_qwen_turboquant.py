@@ -121,7 +121,8 @@ def main():
     from mlx_integration.patch import apply_turboquant, remove_turboquant
 
     tq_cache = make_turboquant_cache(model, key_bits=4, value_bits=5)
-    apply_turboquant(model, sparse_v=True)
+    # No SDPA patch needed — cache decompresses transparently in update_and_fetch
+    # apply_turboquant(model, sparse_v=True)
 
     # Count how many layers use TurboQuant vs standard
     n_tq = sum(1 for c in tq_cache if isinstance(c, TurboQuantKVCache))

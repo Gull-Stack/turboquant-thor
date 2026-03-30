@@ -36,21 +36,13 @@ def _patched_sdpa(
     mask=None,
     sinks=None,
 ):
-    """Replacement SDPA that routes to TurboQuant when our cache is detected."""
-    if isinstance(cache, TurboQuantKVCache):
-        # Use TurboQuant SDPA with sparse V
-        return turboquant_sdpa(
-            queries=queries,
-            keys=keys,
-            values=values,
-            scale=scale,
-            mask=mask,
-            sparse_v_config=_sparse_v_config,
-            layer_idx=cache.layer_idx,
-        )
-    else:
-        # Fall back to original SDPA
-        return _original_sdpa(queries, keys, values, cache=cache, scale=scale, mask=mask, sinks=sinks)
+    """Replacement SDPA — uses standard MLX SDPA for all layers.
+
+    TurboQuant cache decompresses keys/values in update_and_fetch,
+    so the standard optimized SDPA works correctly on the decompressed
+    tensors. No custom attention needed.
+    """
+    return _original_sdpa(queries, keys, values, cache=cache, scale=scale, mask=mask, sinks=sinks)
 
 
 # Module-level sparse V config (set by apply_turboquant)
