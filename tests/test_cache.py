@@ -114,7 +114,7 @@ class TestTurboQuantKVCache:
             layer_idx=8, n_layers=n_layers, layer_adaptive=True,
         )
         assert cache_late.key_bits == 4
-        assert cache_late.value_bits == 4  # capped at 4
+        assert cache_late.value_bits == 5  # bumped from 4 to 5
 
     def test_state_roundtrip(self):
         """State get/set should preserve cache contents."""

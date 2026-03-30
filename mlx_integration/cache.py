@@ -55,8 +55,8 @@ class TurboQuantKVCache:
         if layer_adaptive and n_layers > 1:
             adaptive_start = int(n_layers * 0.8)
             if layer_idx >= adaptive_start:
-                key_bits = min(key_bits + 1, 4)
-                value_bits = min(value_bits + 1, 4)
+                key_bits = min(key_bits + 1, 5)
+                value_bits = min(value_bits + 1, 5)
 
         self.key_bits = key_bits
         self.value_bits = value_bits
@@ -267,6 +267,25 @@ class TurboQuantKVCache:
         return uncompressed / self.nbytes
 
 
+def _detect_head_dim(model) -> int:
+    """Auto-detect head_dim by scanning model layers for attention modules."""
+    for layer in model.layers:
+        # Check common attention attribute names
+        for attr_name in ('self_attn', 'attention', 'linear_attn'):
+            attn = layer.get(attr_name) if hasattr(layer, 'get') else getattr(layer, attr_name, None)
+            if attn is not None and hasattr(attn, 'head_dim'):
+                return attn.head_dim
+    return 128  # sensible default
+
+
+def _layer_has_kv_cache(layer) -> bool:
+    """Check if a layer uses a KV cache (full attention vs linear attention)."""
+    # Layers with self_attn use standard KV caching
+    if hasattr(layer, 'get'):
+        return 'self_attn' in layer
+    return hasattr(layer, 'self_attn')
+
+
 def make_turboquant_cache(
     model,
     key_bits: int = 3,
@@ -275,7 +294,11 @@ def make_turboquant_cache(
     layer_adaptive: bool = True,
     seed: int = 42,
 ):
-    """Create a list of TurboQuantKVCache instances for all model layers.
+    """Create a list of cache instances for all model layers.
+
+    For layers with full attention (self_attn), creates TurboQuantKVCache.
+    For layers with linear attention (GatedDeltaNet etc.), creates standard
+    mlx-lm KVCache since those layers manage their own state differently.
 
     Drop-in replacement for mlx_lm.models.cache.make_prompt_cache.
 
@@ -288,34 +311,34 @@ def make_turboquant_cache(
         seed: Random seed for rotation
 
     Returns:
-        List of TurboQuantKVCache, one per layer
+        List of cache objects, one per layer
     """
+    from mlx_lm.models.cache import make_prompt_cache
+
     n_layers = len(model.layers)
 
-    # Auto-detect head_dim from model
     if head_dim is None:
-        layer0 = model.layers[0]
-        if hasattr(layer0, 'self_attn'):
-            attn = layer0.self_attn
-        elif hasattr(layer0, 'attention'):
-            attn = layer0.attention
-        else:
-            raise ValueError("Cannot auto-detect head_dim: model layer has no self_attn or attention attribute")
+        head_dim = _detect_head_dim(model)
 
-        if hasattr(attn, 'head_dim'):
-            head_dim = attn.head_dim
-        else:
-            head_dim = 128  # sensible default
+    # Start with the model's default caches (handles hybrid architectures correctly)
+    caches = make_prompt_cache(model)
 
-    return [
-        TurboQuantKVCache(
+    # Count full-attention layers for layer-adaptive calculation
+    full_attn_indices = [i for i in range(n_layers) if _layer_has_kv_cache(model.layers[i])]
+    n_full_attn = len(full_attn_indices)
+
+    # Replace only full-attention layer caches with TurboQuant
+    full_attn_pos = 0
+    for i in full_attn_indices:
+        caches[i] = TurboQuantKVCache(
             key_bits=key_bits,
             value_bits=value_bits,
             head_dim=head_dim,
-            layer_idx=i,
-            n_layers=n_layers,
+            layer_idx=full_attn_pos,
+            n_layers=n_full_attn,
             layer_adaptive=layer_adaptive,
             seed=seed,
         )
-        for i in range(n_layers)
-    ]
+        full_attn_pos += 1
+
+    return caches

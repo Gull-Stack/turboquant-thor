@@ -45,7 +45,7 @@ class TestCodebook:
 
     def test_invalid_bits(self):
         with pytest.raises(ValueError):
-            get_codebook_unscaled(5)
+            get_codebook_unscaled(6)
         with pytest.raises(ValueError):
             get_codebook(0, 128)
 
